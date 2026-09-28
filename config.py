@@ -22,6 +22,7 @@ class Cabinet:
     code: str
     name: str
     token: str
+    analytics_token: str = ""
 
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -32,11 +33,13 @@ CABINETS = {
         code="spb_tt",
         name=os.getenv("WB_NAME_SPB_TT", 'ООО «СПб-ТТ»'),
         token=os.getenv("WB_TOKEN_SPB_TT", "").strip(),
+        analytics_token=os.getenv("WB_ANALYTICS_TOKEN_SPB_TT", "").strip(),
     ),
     "spb_tt_group": Cabinet(
         code="spb_tt_group",
         name=os.getenv("WB_NAME_SPB_TT_GROUP", 'ООО «СПБ-ТТ ГРУПП»'),
         token=os.getenv("WB_TOKEN_SPB_TT_GROUP", "").strip(),
+        analytics_token=os.getenv("WB_ANALYTICS_TOKEN_SPB_TT_GROUP", "").strip(),
     ),
 }
 
