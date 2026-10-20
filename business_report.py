@@ -8,7 +8,7 @@ from history_store import Store, now, key
 from data_quality import complete_sum, percent
 from metric_registry import registry, TABLES
 
-VERSION='3.0.0'
+VERSION='3.0.1'
 
 
 def dates(start,end):
@@ -17,6 +17,10 @@ def dates(start,end):
 
 def change(old,new):
     return new/old-1 if old is not None and old>0 and new is not None else None
+
+
+def usable_orders(source):
+    return source.get('status')=='OK' or (source.get('phase') in {'RUNNING','QUEUED'} and bool(source.get('last_success_at')))
 
 
 def classify(base,fact,new=False,rare_cutoff=1):
@@ -79,7 +83,7 @@ def build(store:Store,day:date,cabinets:list[str],threshold=15,preferences=None,
             status='OK' if cov and cov['status']=='OK' else 'PARTIAL' if ev else 'MISSING'
             if created and ds<created:status='NOT_APPLICABLE'
             current=source.get((c,'orders'),{})
-            if status=='OK' and current.get('status') not in {'OK',None}:status='STALE'
+            if status=='OK' and current.get('status') is not None and not usable_orders(current):status='STALE'
             units=len(ev) if status not in {'MISSING','NOT_APPLICABLE'} else None
             price_sum=complete_sum(x['order_price'] for x in ev) if ev else 0 if status=='OK' else None
             price_status='OK' if status=='OK' and price_sum is not None else status if status!='OK' else 'PARTIAL'
@@ -98,7 +102,7 @@ def build(store:Store,day:date,cabinets:list[str],threshold=15,preferences=None,
                  'return_units':sum(x['event_type']=='return' for x in sales) if sales_ok else None,
                  'sales_status':'OK' if sales_ok else 'MISSING','order_events':None,'order_events_status':'NOT_SUPPORTED',
                  'orders_source_run_id':cov.get('run_id') if cov else None,
-                 'source_day_covered':bool(cov and cov['status']=='OK' and current.get('status')=='OK'),
+                 'source_day_covered':bool(cov and cov['status']=='OK' and usable_orders(current)),
                  'orders_observed_at':cov.get('observed_at') if cov else None,
                  'funnel_status':f.get('status','MISSING'),'funnel_source_run_id':f.get('source_run_id'),
                  'funnel_observed_at':f.get('observed_at')}
@@ -274,7 +278,8 @@ def build(store:Store,day:date,cabinets:list[str],threshold=15,preferences=None,
     for c in cabinets:
         subset=[r for r in all_products if r['cabinet_id']==c]
         have=sum(coverage.get((c,'orders',str(d)),{}).get('status')=='OK' for d in dates(day-timedelta(days=14),day))
-        complete=have==15 and source.get((c,'orders'),{}).get('status')=='OK'
+        current=source.get((c,'orders'),{})
+        complete=have==15 and usable_orders(current)
         def amount(ds,field):
             ev=[e for e in events if e['cabinet_id']==c and e['source']=='orders' and e['day'] in ds]
             return len(ev) if field=='units' else complete_sum(e['order_price'] for e in ev) if ev else 0
@@ -287,6 +292,7 @@ def build(store:Store,day:date,cabinets:list[str],threshold=15,preferences=None,
                           'change_rate':change(base,factual) if complete else None,'gross_drop':drop if complete else None,'gross_gain':gain if complete else None,
                           'order_amount':amount({str(day)},'money') if complete else None,'base_order_amount_avg':(amount(baseline_days,'money')/14 if amount(baseline_days,'money') is not None else None) if complete else None,
                           'products':len(subset),'available_days':have,'expected_days':15,'status':'OK' if complete else 'PARTIAL',
+                          'source_phase':current.get('phase'),'source_pages':current.get('pages',0),'source_records':current.get('records',0),'last_success_at':current.get('last_success_at') or (current.get('completed_at') if current.get('status')=='OK' else None),
                           'reason':source.get((c,'orders'),{}).get('reason','Нет успешной загрузки Statistics'),
                           'reconciliation_delta':(gain-drop)-(factual-base) if complete else None})
         same_weekdays=[day-timedelta(days=7*i) for i in range(1,9)]
@@ -444,7 +450,11 @@ def telegram(report,names):
     lines=[f'<b>WB: {report["report_date"]}</b> · v{report["report_version"]} r{report["revision"]}',
            'Сформировано: '+datetime.fromisoformat(report['generated_at']).astimezone(__import__('zoneinfo').ZoneInfo('Europe/Moscow')).strftime('%d.%m %H:%M МСК')]
     if report['status']!='OK':lines.append('<b>Итог неполный. Ниже известные подытоги и ограничения.</b>')
+    if any(s.get('source_phase') in {'RUNNING','QUEUED'} and not s.get('last_success_at') for s in report['summary']):
+        lines.append('Идёт первая загрузка. 0 подтверждённых дней означает, что окончание выгрузки ещё не подтверждено, а не отсутствие заказов. Дополнительные источники могут ожидать очереди. /quality — прогресс; /overview — обновлённый обзор.')
     for s in report['summary']:
+        if s.get('source_phase') in {'RUNNING','QUEUED'}:
+            lines.append(f'Загрузка: {s.get("source_pages",0)} стр., {s.get("source_records",0)} строк.'+(' Показан ранее подтверждённый срез; обновление ещё выполняется.' if s.get('last_success_at') else ' Подытоги пока не являются полными.'))
         lines+=[f'<b>{escape(names.get(s["cabinet_id"],s["cabinet_id"]))}</b>',
                 f'Единицы: {num(s["ordered_units"])}; известный подытог {s["known_ordered_units"]}. База/день: {num(s["base_14_avg"])}.',
                 f'Изменение: {num(s["delta_units"])} шт.; '+(f'{s["change_rate"]:+.1%}' if s['change_rate'] is not None else 'Н/Д'),

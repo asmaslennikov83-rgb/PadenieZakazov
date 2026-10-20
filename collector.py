@@ -96,7 +96,9 @@ class Collector:
 
     async def sync_source(self,run,cabinet,source,operation,budget=150):
         started=now()
-        meta={'status':'PARTIAL','reason':'Синхронизация выполняется','requested_at':started,'period_start':None,'period_end':None,'pages':0,'records':0,'cursor':None,'snapshot_at':None}
+        previous=[x for x in self.store.sources() if x['cabinet_id']==cabinet and x['source']==source and (x.get('last_success_at') or x.get('status')=='OK')]
+        last=previous[-1] if previous else {}
+        meta={'status':'PARTIAL','phase':'RUNNING','reason':'Загрузка выполняется; полный итог пока не подтверждён','requested_at':started,'updated_at':started,'completed_at':None,'last_success_at':last.get('last_success_at') or last.get('completed_at'),'period_start':None,'period_end':None,'pages':0,'records':0,'cursor':None,'snapshot_at':None}
         self.store.source(run,cabinet,source,**meta)
         try:
             async with asyncio.timeout(budget):
@@ -110,16 +112,20 @@ class Collector:
         except asyncio.TimeoutError:
             meta.update(status='PARTIAL' if meta['records'] else 'ERROR',reason='Истёк бюджет загрузки; данные не объявлены полными')
         except asyncio.CancelledError:
-            meta.update(status='PARTIAL',reason='Загрузка прервана остановкой процесса; курсор сохранён')
+            meta.update(status='PARTIAL',phase='INTERRUPTED',completed_at=now(),updated_at=now(),reason='Загрузка прервана остановкой процесса; курсор сохранён')
             self.store.source(run,cabinet,source,**meta)
             raise
         except Exception as exc:
             meta.update(status='PARTIAL' if meta['records'] else 'ERROR',reason=f'Ошибка адаптера {type(exc).__name__}; ответ не экспортируется')
-        previous=[x for x in self.store.sources() if x['cabinet_id']==cabinet and x['source']==source and x.get('status')=='OK']
-        meta['last_success_at']=meta.get('last_success_at') if meta.get('cache_hit') else now() if meta['status']=='OK' else previous[-1].get('completed_at') if previous else None
+        meta['last_success_at']=meta.get('last_success_at') if meta.get('cache_hit') or meta['status']!='OK' else now()
         meta['completed_at']=now()
+        meta.update(phase='FINISHED' if meta['status']=='OK' else 'FAILED',updated_at=meta['completed_at'])
         self.store.source(run,cabinet,source,**meta)
         return meta
+
+    def progress(self,run,cabinet,source,meta):
+        meta.update(updated_at=now(),reason=f'Загрузка выполняется: получено страниц {meta["pages"]}, строк {meta["records"]}; ожидается подтверждение окончания')
+        self.store.source(run,cabinet,source,**meta)
 
     async def sync(self,cabinets,extras=False):
         run=uuid.uuid4().hex
@@ -127,15 +133,24 @@ class Collector:
             owner=self.store.lease('sync:'+cabinet,1800)
             if not owner: return
             try:
+                planned=['orders']
+                if extras:
+                    planned+=['catalog','prices','stocks_wb','stocks_mp','funnel_period','funnel','sales','ads']
+                    if os.getenv('WB_ENABLE_SEARCH','false').lower()=='true':planned+=['search']
+                    if os.getenv('WB_ENABLE_STOCK_HISTORY','true').lower()=='true':planned+=['stock_history_wb','stock_history_mp']
+                prior={s['source']:s for s in self.store.sources() if s['cabinet_id']==cabinet}
+                for source in planned:
+                    old=prior.get(source,{})
+                    self.store.source(run,cabinet,source,status='MISSING',phase='QUEUED',reason='Ожидает загрузки в текущем проходе; права доступа ещё не проверены этим запросом',queued_at=now(),requested_at=None,completed_at=None,pages=0,records=0,last_success_at=old.get('last_success_at') or (old.get('completed_at') if old.get('status')=='OK' else None))
                 await self.sync_source(run,cabinet,'orders',lambda m:self.ledger(run,cabinet,'orders',m))
                 if extras:
-                    for source,fn in [('sales',lambda m:self.ledger(run,cabinet,'sales',m)),
-                                      ('catalog',lambda m:self.catalog(run,cabinet,m)),
+                    for source,fn in [('catalog',lambda m:self.catalog(run,cabinet,m)),
                                       ('prices',lambda m:self.prices(run,cabinet,m)),
                                       ('stocks_wb',lambda m:self.stocks(run,cabinet,'wb',m)),
                                       ('stocks_mp',lambda m:self.stocks(run,cabinet,'mp',m)),
                                       ('funnel_period',lambda m:self.funnel_period(run,cabinet,m)),
-                                      ('funnel',lambda m:self.funnel(run,cabinet,m))]:
+                                      ('funnel',lambda m:self.funnel(run,cabinet,m)),
+                                      ('sales',lambda m:self.ledger(run,cabinet,'sales',m))]:
                         await self.sync_source(run,cabinet,source,fn,budget=int(os.getenv('WB_OPTIONAL_BUDGET_SECONDS','90')))
                     if os.getenv('WB_ENABLE_SEARCH','false').lower()=='true':
                         await self.sync_source(run,cabinet,'search',lambda m:self.search(run,cabinet,m))
@@ -161,6 +176,7 @@ class Collector:
         previous=(date.fromisoformat(state['completed_at'][:10])-timedelta(days=2)).isoformat() if state.get('completed_at') else start.isoformat()
         cursor=pending or min(recent,previous)
         meta.update(period_start=str(start),period_end=str(today-timedelta(days=1)),cursor=cursor)
+        self.store.source(run,cabinet,source,**meta)
         seen=set()
         for _ in range(120):
             page=await self.http.request(cabinet,source,'GET',f'https://statistics-api.wildberries.ru/api/v1/supplier/{source}',self.token(cabinet,'statistics'),interval=61,params={'dateFrom':cursor,'flag':0})
@@ -169,6 +185,7 @@ class Collector:
             if not page:
                 self.store.cover(run,cabinet,source,max(start,today-timedelta(days=90)),today-timedelta(days=1))
                 self.store.sync_state(cabinet,source,{'history_start':str(start),'completed_at':now(),'pending_cursor':None})
+                self.progress(run,cabinet,source,meta)
                 return
             signature=key(page)
             if signature in seen: raise SourceError('PARTIAL','Повтор страницы: полная загрузка не подтверждена')
@@ -195,6 +212,7 @@ class Collector:
                 records.append(rec)
             self.store.events(run,cabinet,source,records)
             meta['records']+=len(records)
+            self.progress(run,cabinet,source,meta)
             raw_cursor=page[-1].get('lastChangeDate')
             if not raw_cursor or str(raw_cursor)<=str(cursor): raise SourceError('PARTIAL','Курсор не продвинулся; полный итог запрещён')
             cursor=str(raw_cursor)  # Preserve fractional seconds exactly.

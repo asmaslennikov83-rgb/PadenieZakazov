@@ -103,6 +103,23 @@ class Store:
             rows=self.rows('SELECT payload FROM v3_sources ORDER BY rowid')
         return [json.loads(x['payload']) for x in rows]
 
+    def recover_interrupted_sources(self):
+        # Only at startup while the process instance lock is held.
+        with self.connect() as db:db.execute("DELETE FROM v3_leases WHERE name LIKE 'sync:%'")
+        count=0
+        for row in self.sources():
+            if row.get('completed_at') or row.get('phase') not in {'RUNNING','QUEUED',None}:continue
+            running=row.get('phase')=='RUNNING' or row.get('reason')=='Синхронизация выполняется'
+            queued=row.get('phase')=='QUEUED'
+            if not running and not queued:continue
+            c=row.pop('cabinet_id');s=row.pop('source');run=row.pop('run_id')
+            row.update(phase='INTERRUPTED' if running else 'NOT_STARTED',status='PARTIAL' if running else 'MISSING',completed_at=now(),updated_at=now(),reason='Процесс завершился до подтверждения загрузки; сохранённые курсоры будут продолжены' if running else 'Предыдущий процесс завершился до начала запроса этого источника; доступ не проверен')
+            row.update(run_id=run,cabinet_id=c,source=s)
+            with self.connect() as db:
+                db.execute('UPDATE v3_sources SET payload=? WHERE run_id=? AND cabinet_id=? AND source=?',(dumps(row),run,c,s))
+            count+=1
+        return count
+
     def product(self, db, cabinet, n, attributes, observed):
         old=db.execute('SELECT payload FROM v3_products WHERE cabinet_id=? AND nm_id=?',(cabinet,n)).fetchone()
         payload=json.loads(old[0]) if old else {}
@@ -182,7 +199,7 @@ class Store:
             db.execute('UPDATE v3_deliveries SET status=?,updated_at=?,message_id=? WHERE delivery_key=?',(status,now(),str(message_id) if message_id else None,delivery_key))
 
     def save_report(self, run, day, payload):
-        fingerprint=key(payload['summary'],payload['all_products'],payload['tables'],payload.get('comparisons'))
+        fingerprint=key(payload.get('report_version'),payload['summary'],payload['all_products'],payload['tables'],payload.get('comparisons'))
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             prior=db.execute('SELECT payload,run_id,revision,created_at FROM v3_reports WHERE report_date=? ORDER BY revision DESC LIMIT 1',(str(day),)).fetchone()

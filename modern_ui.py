@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime,timedelta
 from html import escape
 import json
+import logging
 from pathlib import Path
 import time
 from zoneinfo import ZoneInfo
@@ -12,7 +13,7 @@ from aiogram.filters import Command
 from aiogram.types import BufferedInputFile,InlineKeyboardButton,InlineKeyboardMarkup
 from config import ALLOWED_TELEGRAM_IDS,CABINETS,DB_PATH
 from db import get_user_settings
-from history_store import Store,key
+from history_store import Store,key,now
 from collector import Collector
 from business_report import build,telegram
 from analytical_export import build_package
@@ -32,7 +33,7 @@ def menu():
     rows=[ [('Обзор','overview'),('Ситуация сейчас','now')], [('Падения','drops'),('Рост и возможности','growth')],
            [('Риски остатков','stocks'),('Проверить товар','product')], [('Сравнить кабинеты','compare'),('Реклама','ads')],
            [('Отчёт 7 дней','period7'),('14 дней','period14'),('30 дней','period30')],
-           [('Все товары','all'),('Качество данных','quality'),('Excel','excel')],
+           [('Все товары','all'),('Качество данных','quality'),('Excel','excel')], [('Обновить данные','refresh')],
            [('Прежний отчёт','legacy'),('Настройки','settings')] ]
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t,callback_data='v3:'+v) for t,v in row] for row in rows])
 
@@ -50,10 +51,15 @@ async def report_for(user_id,refresh=False):
     day=datetime.now(TZ).date()-timedelta(days=1)
     codes=selected(settings.cabinet_mode)
     if refresh:await collector.sync(codes,extras=False)
-    signature=(user_id,str(day),settings.threshold,settings.cabinet_mode,json.dumps(store.preference(user_id),sort_keys=True))
+    sources=[s for s in store.sources() if s['cabinet_id'] in codes]
+    latest={}
+    for s in sources:latest[s['cabinet_id'],s['source']]=s
+    signature=(user_id,str(day),settings.threshold,settings.cabinet_mode,json.dumps(store.preference(user_id),sort_keys=True),key(sorted(latest.items())))
     saved=cache.get(signature)
     if not refresh and saved and time.monotonic()-saved[0]<120:return saved[1]
     report=await asyncio.to_thread(build,store,day,codes,settings.threshold,store.preference(user_id))
+    for old in list(cache):
+        if old[0]==user_id or time.monotonic()-cache[old][0]>=120:cache.pop(old,None)
     cache[signature]=(time.monotonic(),report)
     return report
 
@@ -164,11 +170,31 @@ async def refresh_background():
     cache.clear()
 
 
+async def request_refresh(event,bot,user_id,chat_id):
+    if jobs:
+        await event.answer('Загрузка уже выполняется. /quality — прогресс, /overview — текущий результат.');return
+    settings=await get_user_settings(user_id)
+    codes=selected(settings.cabinet_mode)
+    if any(store.rows('SELECT owner FROM v3_leases WHERE name=? AND expires_at>?',('sync:'+c,now())) for c in codes):
+        await event.answer('Уже идёт фоновая загрузка. Повторные запросы не запущены. /quality — прогресс, /overview — текущий результат.');return
+    async def run():
+        try:
+            await collector.sync(codes,extras=True)
+            cache.clear()
+            await bot.send_message(chat_id,'Проход загрузки завершён. /quality — ошибки и доступность источников; /overview — новый обзор; /excel — новый пакет. Завершение прохода не означает успешность каждого источника.')
+        except Exception:
+            logging.getLogger(__name__).exception('Manual refresh failed')
+            await bot.send_message(chat_id,'Проход загрузки прерван. Сохранённые данные и курсоры остаются в базе. /quality — состояние источников.')
+    task=asyncio.create_task(run());jobs.add(task);task.add_done_callback(jobs.discard)
+    await event.answer('Запущено обновление заказов и дополнительных источников. Оно может занять несколько минут из-за ограничений WB. Если фоновая загрузка уже идёт, повторные запросы не запускаются. /quality — прогресс.')
+
+
 @router.callback_query(F.data.startswith('v3:'))
 async def view(call,bot):
     if not await allowed(call):return
     await call.answer()
     kind=call.data.split(':',1)[1]
+    if kind=='refresh':await request_refresh(call.message,bot,call.from_user.id,call.message.chat.id);return
     if kind=='settings':
         await call.message.answer('Существующие настройки сохранены. /menu — порог, сортировка, время, кабинет.\nДополнительные фильтры: /filters\nПроверить товар: /product nmID или артикул.\nИстория действий: /actions');return
     if kind=='legacy':
@@ -181,10 +207,11 @@ async def view(call,bot):
     else:await call.message.answer(screen(report,kind),reply_markup=menu())
 
 
-@router.message(Command('overview','now','drops','growth','stocks','quality','excel','ads','compare'))
+@router.message(Command('overview','now','drops','growth','stocks','quality','excel','ads','compare','refresh'))
 async def command(message,bot):
     if not await allowed(message):return
     kind=message.text.split()[0].split('@')[0][1:]
+    if kind=='refresh':await request_refresh(message,bot,message.from_user.id,message.chat.id);return
     report=await report_for(message.from_user.id)
     if kind=='excel':await send_package(bot,message.chat.id,report)
     else:await message.answer(screen(report,kind),reply_markup=menu())

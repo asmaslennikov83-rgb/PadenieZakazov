@@ -383,6 +383,7 @@ async def main() -> None:
     )
     dp = Dispatcher()
     from modern_ui import router as modern_router, refresh_background, urgent_tick, correction_tick, store
+    store.recover_interrupted_sources()
     dp.include_router(modern_router)
     dp.include_router(router)
 
