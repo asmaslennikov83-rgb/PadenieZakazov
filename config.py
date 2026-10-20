@@ -25,7 +25,7 @@ class Cabinet:
     analytics_token: str = ""
 
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")).strip()
 ALLOWED_TELEGRAM_IDS = _csv_ints(os.getenv("ALLOWED_TELEGRAM_IDS", ""))
 
 CABINETS = {

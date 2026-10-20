@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
 from analytics_client import AnalyticsError, analytics_client
 from stock_history_client import StockHistoryError, stock_history_client
-from wb_client import wb_orders_client
+from wb_client import wb_orders_client, parse_wb_order_date
+from data_quality import nm_id as normalize_nm_id, complete_sum, percent
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ class DropRow:
     search_position_first_7: float | None = None
     search_position_last_7: float | None = None
     search_position_change: float | None = None
+    data_status: str = ""
 
 
 @dataclass
@@ -59,6 +62,7 @@ class CabinetReport:
     stock_history_available: bool = False
     funnel_available: bool = False
     search_available: bool = False
+    diagnostics: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _article(row: dict[str, Any]) -> str:
@@ -66,17 +70,17 @@ def _article(row: dict[str, Any]) -> str:
     value = str(value).strip()
     if value:
         return value
-    nm_id = row.get("nmId")
+    nm_id = row.get("nmId", row.get("nmID"))
     return f"nmID {nm_id}" if nm_id else "Без артикула"
 
 
 def _price(order: dict[str, Any]) -> float | None:
-    for key in ("priceWithDisc", "finishedPrice"):
+    for key in ("priceWithDisc",):
         try:
             price = float(order.get(key))
         except (TypeError, ValueError):
             continue
-        if price > 0:
+        if math.isfinite(price) and price > 0:
             return price
     return None
 
@@ -112,16 +116,13 @@ async def build_cabinet_report(cabinet_code: str, cabinet_name: str, threshold: 
     for order in orders:
         article = _article(order)
         known_articles.add(article)
-        try:
-            nm_id = int(order.get("nmId"))
-        except (TypeError, ValueError):
-            nm_id = 0
+        nm_id = normalize_nm_id(order.get("nmId", order.get("nmID")))
         if nm_id:
             article_nm_ids.setdefault(article, set()).add(nm_id)
-        try:
-            order_day = date.fromisoformat(str(order.get("date", ""))[:10])
-        except ValueError:
+        parsed_day = parse_wb_order_date(order.get("date"))
+        if parsed_day is None:
             continue
+        order_day = parsed_day.date()
         price = _price(order)
         if baseline_start <= order_day <= baseline_end:
             baseline_counts[article] = baseline_counts.get(article, 0) + 1
@@ -170,63 +171,80 @@ async def build_cabinet_report(cabinet_code: str, cabinet_name: str, threshold: 
             nm_ids=tuple(sorted(article_nm_ids.get(article, set()))),
         ))
 
+    diagnostics = []
+    owners = {}
+    for article, ids in article_nm_ids.items():
+        for n in ids:
+            owners.setdefault(n, set()).add(article)
+    ambiguous = {n for n, articles in owners.items() if len(articles) > 1}
+    if ambiguous:
+        diagnostics.append(("Сопоставление", f"Неоднозначные nmId (несколько артикулов продавца): {sorted(ambiguous)}. Дополнительные метрики этих строк не агрегируются."))
     funnel_available = search_available = stock_history_available = False
+    first_funnel, last_funnel, search, fbo, fbs = {}, {}, {}, {}, {}
     if result:
         nm_ids = sorted({nm for row in result for nm in row.nm_ids})
+        diagnostics.append(("Сопоставление", f"{len(nm_ids)} уникальных nmId; строк без nmId: {sum(not r.nm_ids for r in result)}"))
         if nm_ids:
             try:
-                first_funnel = await analytics_client.get_funnel_history(cabinet_code, baseline_start, split_day - timedelta(days=1), nm_ids)
-                await asyncio.sleep(21)
-                last_funnel = await analytics_client.get_funnel_history(cabinet_code, split_day, baseline_end, nm_ids)
-                funnel_available = bool(first_funnel or last_funnel)
-                for row in result:
-                    fv = fc = fo = fw = lv = lc = lo = lw = 0
-                    for nm in row.nm_ids:
-                        fm, lm = first_funnel.get(nm), last_funnel.get(nm)
-                        if fm:
-                            fv += fm.views; fc += fm.carts; fo += fm.orders; fw += fm.wishlist
-                        if lm:
-                            lv += lm.views; lc += lm.carts; lo += lm.orders; lw += lm.wishlist
-                    if funnel_available:
-                        row.views_first_7, row.views_last_7 = fv, lv
-                        row.views_change_percent = _pct_change(fv, lv)
-                        row.carts_first_7, row.carts_last_7 = fc, lc
-                        row.carts_change_percent = _pct_change(fc, lc)
-                        row.view_to_cart_first_7 = fc / fv * 100 if fv else None
-                        row.view_to_cart_last_7 = lc / lv * 100 if lv else None
-                        row.cart_to_order_first_7 = fo / fc * 100 if fc else None
-                        row.cart_to_order_last_7 = lo / lc * 100 if lc else None
-                        row.wishlist_first_7, row.wishlist_last_7 = fw, lw
+                first_funnel, last_funnel = await analytics_client.get_funnel_periods(
+                    cabinet_code, baseline_start, split_day - timedelta(days=1), split_day, baseline_end, nm_ids)
+                diagnostics.append(("Воронка", f"nmId: первый период {len(first_funnel)}/{len(nm_ids)}, последний {len(last_funnel)}/{len(nm_ids)}"))
             except Exception as exc:
-                logger.warning("Воронка недоступна для %s: %s", cabinet_code, exc)
-
+                logger.warning("Воронка %s: %s", cabinet_code, exc)
+                diagnostics.append(("Воронка", f"НД: {exc}"))
             try:
-                await asyncio.sleep(21)
-                search = await analytics_client.get_search_positions(cabinet_code, split_day, baseline_end, baseline_start, split_day - timedelta(days=1), nm_ids)
-                search_available = bool(search)
-                for row in result:
-                    cur = [search[n].avg_position for n in row.nm_ids if n in search and search[n].avg_position is not None]
-                    past = [search[n].avg_position_past for n in row.nm_ids if n in search and search[n].avg_position_past is not None]
-                    if cur:
-                        row.search_position_last_7 = sum(cur)/len(cur)
-                    if past:
-                        row.search_position_first_7 = sum(past)/len(past)
-                    if row.search_position_last_7 is not None and row.search_position_first_7 is not None:
-                        row.search_position_change = row.search_position_last_7 - row.search_position_first_7
+                search = await analytics_client.get_search_positions(cabinet_code, split_day, baseline_end,
+                    baseline_start, split_day - timedelta(days=1), nm_ids)
+                diagnostics.append(("Поиск", f"Получены позиции для {len(search)}/{len(nm_ids)} nmId"))
             except Exception as exc:
-                logger.warning("Поисковая аналитика недоступна для %s: %s", cabinet_code, exc)
-
-            try:
-                await asyncio.sleep(21)
-                fbo = await stock_history_client.get_stock_for_day(cabinet_code, yesterday, nm_ids, "wb")
-                await asyncio.sleep(21)
-                fbs = await stock_history_client.get_stock_for_day(cabinet_code, yesterday, nm_ids, "mp")
-                stock_history_available = bool(fbo or fbs)
-                for row in result:
-                    row.fbo_stock_yesterday = sum(fbo.get(n, 0) for n in row.nm_ids)
-                    row.fbs_stock_yesterday = sum(fbs.get(n, 0) for n in row.nm_ids)
-            except Exception as exc:
-                logger.warning("История остатков недоступна для %s: %s", cabinet_code, exc)
+                logger.warning("Поиск %s: %s", cabinet_code, exc)
+                diagnostics.append(("Поиск", f"НД: {exc}"))
+            # Независимые источники: сбой FBS не уничтожает уже полученный FBO.
+            for stock_type, target in (("wb", fbo), ("mp", fbs)):
+                try:
+                    values = await stock_history_client.get_stock_for_day(cabinet_code, yesterday, nm_ids, stock_type)
+                    target.update(values)
+                    diagnostics.append((f"Остатки {stock_type}", f"Сопоставлено {len(set(values) & set(nm_ids))}/{len(nm_ids)} nmId"))
+                except Exception as exc:
+                    logger.warning("Остатки %s %s: %s", cabinet_code, stock_type, exc)
+                    diagnostics.append((f"Остатки {stock_type}", f"НД: {exc}"))
+        for row in result:
+            ids = () if any(n in ambiguous for n in row.nm_ids) else row.nm_ids
+            for suffix, source in (("first_7", first_funnel), ("last_7", last_funnel)):
+                values = {}
+                for name in ("views", "carts", "orders", "wishlist"):
+                    values[name] = complete_sum(getattr(source[n], name) if n in source else None for n in ids)
+                setattr(row, "views_" + suffix, values["views"])
+                setattr(row, "carts_" + suffix, values["carts"])
+                setattr(row, "wishlist_" + suffix, values["wishlist"])
+                setattr(row, "view_to_cart_" + suffix, percent(values["carts"], values["views"]))
+                setattr(row, "cart_to_order_" + suffix, percent(values["orders"], values["carts"]))
+            row.views_change_percent = _pct_change(row.views_first_7, row.views_last_7)
+            row.carts_change_percent = _pct_change(row.carts_first_7, row.carts_last_7)
+            row.fbo_stock_yesterday = complete_sum(fbo.get(n) for n in ids)
+            row.fbs_stock_yesterday = complete_sum(fbs.get(n) for n in ids)
+            # Средние позиции нельзя суммировать или усреднять без весов показов.
+            if len(ids) == 1 and ids[0] in search:
+                row.search_position_first_7 = search[ids[0]].avg_position_past
+                row.search_position_last_7 = search[ids[0]].avg_position
+                if row.search_position_first_7 is not None and row.search_position_last_7 is not None:
+                    row.search_position_change = row.search_position_last_7 - row.search_position_first_7
+            statuses = []
+            if not ids:
+                statuses.append("Не найден однозначный nmId")
+            if len(ids) > 1:
+                statuses.append("Позиция НД: несколько nmId, нет весов показов")
+            for label, value in (("FBO", row.fbo_stock_yesterday), ("FBS", row.fbs_stock_yesterday),
+                                 ("просмотры 1", row.views_first_7), ("просмотры 2", row.views_last_7),
+                                 ("корзины 1", row.carts_first_7), ("корзины 2", row.carts_last_7),
+                                 ("избранное 1", row.wishlist_first_7), ("избранное 2", row.wishlist_last_7),
+                                 ("позиция 1", row.search_position_first_7), ("позиция 2", row.search_position_last_7)):
+                if value is None:
+                    statuses.append(label + ": НД")
+            row.data_status = "; ".join(statuses) or "Данные получены"
+        stock_history_available = any(r.fbo_stock_yesterday is not None or r.fbs_stock_yesterday is not None for r in result)
+        funnel_available = any(r.views_first_7 is not None or r.views_last_7 is not None for r in result)
+        search_available = any(r.search_position_first_7 is not None or r.search_position_last_7 is not None for r in result)
 
     if sort_mode == "average":
         result.sort(key=lambda x: (x.average_per_day, x.drop_percent), reverse=True)
@@ -235,4 +253,4 @@ async def build_cabinet_report(cabinet_code: str, cabinet_name: str, threshold: 
     else:
         result.sort(key=lambda x: (x.drop_percent, x.average_per_day), reverse=True)
 
-    return CabinetReport(cabinet_code, cabinet_name, baseline_start, baseline_end, yesterday, threshold, result, stock_history_available, funnel_available, search_available)
+    return CabinetReport(cabinet_code, cabinet_name, baseline_start, baseline_end, yesterday, threshold, result, stock_history_available, funnel_available, search_available, diagnostics)

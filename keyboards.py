@@ -4,6 +4,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="Обзор, рост и качество данных", callback_data="v3:overview")],
             [InlineKeyboardButton(text="📊 Проверить сейчас", callback_data="check_now")],
             [
                 InlineKeyboardButton(text="📉 Изменить порог", callback_data="threshold"),

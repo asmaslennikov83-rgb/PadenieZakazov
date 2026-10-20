@@ -315,7 +315,7 @@ async def build_reports(
     return reports
 
 
-async def send_report(
+async def send_legacy_report(
     bot: Bot,
     chat_id: int,
     settings: UserSettings,
@@ -366,6 +366,7 @@ async def scheduler_tick(bot: Bot) -> None:
                 chat_id=settings.user_id,
                 settings=settings,
                 force_refresh=False,
+                scheduled=True,
             )
             await mark_sent(settings.user_id, today)
         except Exception:
@@ -381,6 +382,8 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+    from modern_ui import router as modern_router, refresh_background, urgent_tick, correction_tick, store
+    dp.include_router(modern_router)
     dp.include_router(router)
 
     scheduler = AsyncIOScheduler(timezone=TZ)
@@ -393,6 +396,10 @@ async def main() -> None:
         coalesce=True,
     )
     scheduler.start()
+    scheduler.add_job(refresh_background, trigger="interval", minutes=20, max_instances=1, coalesce=True, next_run_time=datetime.now(TZ))
+    scheduler.add_job(urgent_tick, trigger="interval", minutes=5, args=[bot], max_instances=1, coalesce=True)
+    scheduler.add_job(correction_tick, trigger="interval", minutes=5, args=[bot], max_instances=1, coalesce=True)
+    scheduler.add_job(store.backup, trigger="cron", hour=0, minute=30, max_instances=1, coalesce=True)
 
     logger.info("Bot started")
     try:
@@ -402,5 +409,10 @@ async def main() -> None:
         await bot.session.close()
 
 
+from modern_ui import send_report
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    from runtime_lock import instance_lock
+    from config import DB_PATH
+    with instance_lock(DB_PATH.parent / 'bot.lock'):
+        asyncio.run(main())

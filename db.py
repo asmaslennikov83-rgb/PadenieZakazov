@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 from datetime import date
 
 import aiosqlite
@@ -43,6 +44,9 @@ async def init_db() -> None:
                 (user_id,),
             )
         await db.commit()
+
+    from history_store import Store
+    await asyncio.to_thread(Store(DB_PATH).migrate)
 
 
 async def ensure_user(user_id: int) -> None:

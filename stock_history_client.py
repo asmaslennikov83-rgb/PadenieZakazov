@@ -4,14 +4,17 @@ import asyncio
 import csv
 import io
 import logging
+import json
+import time
 import uuid
 import zipfile
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import aiohttp
 
 from config import CABINETS, HTTP_TIMEOUT_SECONDS
+from data_quality import nm_id, count
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +31,26 @@ class StockHistoryError(RuntimeError):
 class StockHistoryClient:
     """Получение дневных исторических остатков WB через STOCK_HISTORY_DAILY_CSV."""
 
-    async def get_stock_for_day(
+    def __init__(self):
+        self._cache = {}
+        self._locks = {}
+        self._last_create = {}
+
+    async def get_stock_for_day(self, cabinet_code, day, nm_ids, stock_type):
+        ids = tuple(sorted({n for value in nm_ids if (n := nm_id(value)) is not None}))
+        key = (cabinet_code, day, ids, stock_type)
+        lock = self._locks.setdefault(cabinet_code, asyncio.Lock())
+        async with lock:
+            cached = self._cache.get(key)
+            if cached and time.monotonic() - cached[0] < 7200:
+                return dict(cached[1])
+            await asyncio.sleep(max(0, 21 - (time.monotonic() - self._last_create.get(cabinet_code, 0))))
+            self._last_create[cabinet_code] = time.monotonic()
+            value = await self._get_stock_for_day(cabinet_code, day, list(ids), stock_type)
+            self._cache[key] = (time.monotonic(), value)
+            return dict(value)
+
+    async def _get_stock_for_day(
         self,
         cabinet_code: str,
         day: date,
@@ -40,7 +62,7 @@ class StockHistoryClient:
         cabinet = CABINETS[cabinet_code]
         token = getattr(cabinet, "analytics_token", "") or cabinet.token
         if not token:
-            return {}
+            raise StockHistoryError("Не задан токен Аналитики")
 
         nm_ids = sorted({int(x) for x in nm_ids if x})
         if not nm_ids:
@@ -69,15 +91,33 @@ class StockHistoryClient:
             await self._wait_ready(session, download_id)
             archive = await self._download(session, download_id)
 
-        return self._parse_archive(archive, day)
+        return {n: q for n, q in self._parse_archive(archive, day).items() if n in nm_ids}
+
+    async def _request(self, session, method, path, **kwargs):
+        for attempt in range(3):
+            try:
+                async with session.request(method, BASE_URL + path, **kwargs) as response:
+                    body = await response.read()
+                    if response.status in {200, 201, 202}:
+                        return body
+                    if response.status == 429 and attempt < 2:
+                        try:
+                            delay = float(response.headers.get("Retry-After", "65"))
+                        except ValueError:
+                            delay = 65
+                        await asyncio.sleep(max(21, delay))
+                        continue
+                    if response.status >= 500 and attempt < 2:
+                        await asyncio.sleep(3 * (attempt + 1))
+                        continue
+                    raise StockHistoryError(f"История остатков {path}: HTTP {response.status}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt == 2:
+                    raise StockHistoryError("Нет соединения с WB для истории остатков") from exc
+                await asyncio.sleep(3 * (attempt + 1))
 
     async def _create(self, session: aiohttp.ClientSession, payload: dict[str, Any]) -> None:
-        async with session.post(BASE_URL + CREATE_PATH, json=payload) as response:
-            text = await response.text()
-            if response.status not in {200, 201, 202}:
-                raise StockHistoryError(
-                    f"Не удалось создать отчёт остатков: HTTP {response.status}: {text[:500]}"
-                )
+        await self._request(session, "POST", CREATE_PATH, json=payload)
 
     async def _wait_ready(self, session: aiohttp.ClientSession, download_id: str) -> None:
         # Лимит WB: 3 запроса/мин, интервал 20 сек.
@@ -85,23 +125,16 @@ class StockHistoryClient:
         for _ in range(7):
             await asyncio.sleep(20)
             params = [("filter[downloadIds]", download_id)]
-            async with session.get(BASE_URL + STATUS_PATH, params=params) as response:
-                text = await response.text()
-                if response.status != 200:
-                    if response.status == 429:
-                        continue
-                    raise StockHistoryError(
-                        f"Ошибка статуса отчёта остатков: HTTP {response.status}: {text[:500]}"
-                    )
-                try:
-                    data = await response.json(content_type=None)
-                except Exception as exc:
-                    raise StockHistoryError("WB вернул некорректный статус отчёта") from exc
+            body = await self._request(session, "GET", STATUS_PATH, params=params)
+            try:
+                data = json.loads(body)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise StockHistoryError("WB вернул некорректный статус отчёта") from exc
 
             items = data.get("data") if isinstance(data, dict) else None
             if not isinstance(items, list):
                 continue
-            item = next((x for x in items if str(x.get("id")) == download_id), None)
+            item = next((x for x in items if isinstance(x, dict) and str(x.get("id")) == download_id), None)
             if not item:
                 continue
             status = str(item.get("status", "")).upper()
@@ -113,14 +146,7 @@ class StockHistoryClient:
         raise StockHistoryError("История остатков WB не успела сформироваться")
 
     async def _download(self, session: aiohttp.ClientSession, download_id: str) -> bytes:
-        url = BASE_URL + DOWNLOAD_PATH.format(download_id=download_id)
-        async with session.get(url) as response:
-            body = await response.read()
-            if response.status != 200:
-                raise StockHistoryError(
-                    f"Не удалось скачать историю остатков: HTTP {response.status}"
-                )
-            return body
+        return await self._request(session, "GET", DOWNLOAD_PATH.format(download_id=download_id))
 
     def _parse_archive(self, archive: bytes, day: date) -> dict[int, int]:
         result: dict[int, int] = {}
@@ -129,11 +155,22 @@ class StockHistoryClient:
                 csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                 if not csv_names:
                     raise StockHistoryError("В архиве WB нет CSV")
-                raw = zf.read(csv_names[0])
+                parts = [zf.read(name) for name in csv_names]
         except zipfile.BadZipFile as exc:
             raise StockHistoryError("WB вернул повреждённый ZIP истории остатков") from exc
 
-        text = raw.decode("utf-8-sig", errors="replace")
+        for raw in parts:
+            values = self._parse_csv(raw, day)
+            for n, qty in values.items():
+                result[n] = result.get(n, 0) + qty
+        return result
+
+    def _parse_csv(self, raw, day):
+        result = {}
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1251")
         sample = text[:4096]
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
@@ -142,32 +179,36 @@ class StockHistoryClient:
 
         reader = csv.DictReader(io.StringIO(text), dialect=dialect)
         if not reader.fieldnames:
-            return result
+            raise StockHistoryError("Пустой CSV остатков без заголовков")
 
         # WB менял названия полей в отчётах. Парсер принимает несколько вариантов.
         normalized = {self._norm(h): h for h in reader.fieldnames if h}
         nm_col = self._find_col(normalized, ["nmid", "nmidwb", "wbarticle", "articlewb"])
-        qty_col = self._find_col(
+        # InventoryHistoryReportRes is wide: each date is a quantity column.
+        # Example: VendorCode, NmID, ChrtID, OfficeName, 19.10.2026, 20.10.2026.
+        day_col = self._find_col(normalized, [day.strftime("%d.%m.%Y"), day.isoformat()])
+        qty_col = day_col or self._find_col(
             normalized,
-            ["stockcount", "quantity", "stockqty", "stocks", "stock", "остаток", "остатки"],
+            ["stockcount", "quantity", "stockquantity", "stockqty", "stocks", "stock", "остаток", "остатки"],
         )
-        dt_col = self._find_col(normalized, ["dt", "date", "day", "дата"])
+        dt_col = None if day_col else self._find_col(normalized, ["dt", "date", "day", "дата"])
         if not nm_col or not qty_col:
-            logger.warning("Неизвестные колонки STOCK_HISTORY_DAILY_CSV: %s", reader.fieldnames)
-            return result
+            raise StockHistoryError(f"Неизвестные колонки STOCK_HISTORY_DAILY_CSV: {reader.fieldnames}")
 
         for row in reader:
             if dt_col:
-                raw_dt = str(row.get(dt_col, ""))[:10]
-                if raw_dt and raw_dt != day.isoformat():
+                raw_dt = str(row.get(dt_col, "")).strip()[:10]
+                try:
+                    parsed_day = date.fromisoformat(raw_dt) if "-" in raw_dt else datetime.strptime(raw_dt, "%d.%m.%Y").date()
+                except ValueError as exc:
+                    raise StockHistoryError(f"Неизвестный формат даты остатков: {raw_dt}") from exc
+                if parsed_day != day:
                     continue
-            try:
-                nm_id = int(float(str(row.get(nm_col, "0")).replace(" ", "")))
-                qty_raw = str(row.get(qty_col, "0")).replace(" ", "").replace(",", ".")
-                qty = int(round(float(qty_raw or 0)))
-            except (TypeError, ValueError):
-                continue
-            result[nm_id] = result.get(nm_id, 0) + qty
+            n = nm_id(row.get(nm_col))
+            qty = count(row.get(qty_col))
+            if n is None or qty is None:
+                raise StockHistoryError("Некорректный nmId или количество в CSV остатков")
+            result[n] = result.get(n, 0) + qty
 
         return result
 

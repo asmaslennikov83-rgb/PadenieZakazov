@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from data_quality import complete_sum
+
 from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
@@ -43,6 +45,7 @@ def format_report_message(report: CabinetReport, limit: int = 20) -> str:
     if report.stock_history_available: extras.append("остатки")
     if report.search_available: extras.append("поиск")
     lines.append("В Excel: " + ", ".join(extras) + ".")
+    lines.append("Недоступные показатели пустые. Причины — на листе Диагностика.")
     return "\n".join(lines)
 
 
@@ -71,14 +74,14 @@ def build_excel(reports: list[CabinetReport]) -> bytes:
         "Конверсия корзина→заказ — первые 7 дней, %", "Конверсия корзина→заказ — последние 7 дней, %",
         "Добавления в избранное — первые 7 дней", "Добавления в избранное — последние 7 дней",
         "Средняя позиция в поиске — первые 7 дней", "Средняя позиция в поиске — последние 7 дней", "Изменение позиции (+: хуже)",
-        "Базовый период с", "Базовый период по", "Дата сравнения",
+        "Базовый период с", "Базовый период по", "Дата сравнения", "nmId WB", "Статус данных",
     ]
     for report in reports:
         ws = wb.create_sheet(sanitize_sheet_name(report.cabinet_name)); ws.append(headers)
         for c in ws[1]:
             c.font = Font(bold=True); c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         for row in report.rows:
-            total_stock = "" if row.fbo_stock_yesterday is None and row.fbs_stock_yesterday is None else (row.fbo_stock_yesterday or 0) + (row.fbs_stock_yesterday or 0)
+            total_stock = _ib(complete_sum([row.fbo_stock_yesterday, row.fbs_stock_yesterday]))
             ws.append([
                 report.cabinet_name, row.supplier_article, round(row.average_per_day,2), row.yesterday_orders, round(row.drop_percent,2), round(row.absolute_drop,2),
                 round(row.orders_first_7_avg,2), round(row.orders_last_7_avg,2), _rb(row.orders_7d_change_percent),
@@ -89,11 +92,35 @@ def build_excel(reports: list[CabinetReport]) -> bytes:
                 _rb(row.view_to_cart_first_7), _rb(row.view_to_cart_last_7), _rb(row.cart_to_order_first_7), _rb(row.cart_to_order_last_7),
                 _ib(row.wishlist_first_7), _ib(row.wishlist_last_7),
                 _rb(row.search_position_first_7), _rb(row.search_position_last_7), _rb(row.search_position_change),
-                report.baseline_start.strftime("%d.%m.%Y"), report.baseline_end.strftime("%d.%m.%Y"), report.yesterday.strftime("%d.%m.%Y"),
+                report.baseline_start.strftime("%d.%m.%Y"), report.baseline_end.strftime("%d.%m.%Y"), report.yesterday.strftime("%d.%m.%Y"), ", ".join(map(str, row.nm_ids)), row.data_status,
             ])
         widths = [24,28,24,18,16,22,24,24,24,25,25,24,22,20,20,22,22,22,22,25,25,22,27,27,27,27,25,25,28,28,24,18,18,18]
         for i,w in enumerate(widths,1): ws.column_dimensions[get_column_letter(i)].width=w
-        ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions; ws.row_dimensions[1].height=60
+        ws.column_dimensions["AI"].width=24
+        ws.column_dimensions["AJ"].width=70
+        ws.freeze_panes="C2"; ws.auto_filter.ref=ws.dimensions; ws.row_dimensions[1].height=60
+    ds = wb.create_sheet("Диагностика")
+    ds.append(["Кабинет", "Источник", "Результат"])
+    ds.append(["", "Обозначения", "Пусто = НД. 0 = явно полученный ноль. При неполном покрытии nmId сумма не выводится."])
+    ds.append(["", "Остатки", "Исторический срез на 23:59. Нулевой остаток вечером не означает отсутствие товара весь день."])
+    ds.append(["", "Цена", "Средняя priceWithDisc среди заказов. Без заказов цены нет. finishedPrice не подмешивается."])
+    ds.append(["", "Конверсии", "Отношение сумм счётчиков Analytics за период, %. При нулевом знаменателе пусто."])
+    for report in reports:
+        for source, message in report.diagnostics:
+            ds.append([report.cabinet_name, source, message])
+    for col, width in (("A", 26), ("B", 24), ("C", 100)):
+        ds.column_dimensions[col].width = width
+    for cells in ds.iter_rows():
+        for cell in cells:
+            if isinstance(cell.value, str) and cell.value.startswith(("=", "+", "-", "@")):
+                cell.data_type = "s"
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ds.freeze_panes = "A2"
+    for ws in wb.worksheets:
+        for cells in ws.iter_rows():
+            for cell in cells:
+                if isinstance(cell.value, str) and cell.value.startswith(("=", "+", "-", "@")):
+                    cell.data_type = "s"
     if not wb.sheetnames:
         ws=wb.create_sheet("Отчёт"); ws["A1"]="Нет данных"
     stream=BytesIO(); wb.save(stream); return stream.getvalue()
