@@ -8,7 +8,7 @@ from history_store import Store, now, key
 from data_quality import complete_sum, percent
 from metric_registry import registry, TABLES
 
-VERSION='3.0.1'
+VERSION='3.0.2'
 
 
 def dates(start,end):
@@ -20,7 +20,7 @@ def change(old,new):
 
 
 def usable_orders(source):
-    return source.get('status')=='OK' or (source.get('phase') in {'RUNNING','QUEUED'} and bool(source.get('last_success_at')))
+    return source.get('status')=='OK' or (source.get('phase') in {'RUNNING','QUEUED','WAITING_RETRY'} and bool(source.get('last_success_at')))
 
 
 def classify(base,fact,new=False,rare_cutoff=1):
@@ -453,6 +453,8 @@ def telegram(report,names):
     if any(s.get('source_phase') in {'RUNNING','QUEUED'} and not s.get('last_success_at') for s in report['summary']):
         lines.append('Идёт первая загрузка. 0 подтверждённых дней означает, что окончание выгрузки ещё не подтверждено, а не отсутствие заказов. Дополнительные источники могут ожидать очереди. /quality — прогресс; /overview — обновлённый обзор.')
     for s in report['summary']:
+        if s.get('source_phase')=='WAITING_RETRY':
+            lines.append(escape(s['reason']))
         if s.get('source_phase') in {'RUNNING','QUEUED'}:
             lines.append(f'Загрузка: {s.get("source_pages",0)} стр., {s.get("source_records",0)} строк.'+(' Показан ранее подтверждённый срез; обновление ещё выполняется.' if s.get('last_success_at') else ' Подытоги пока не являются полными.'))
         lines+=[f'<b>{escape(names.get(s["cabinet_id"],s["cabinet_id"]))}</b>',

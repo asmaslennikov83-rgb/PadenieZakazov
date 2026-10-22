@@ -31,10 +31,11 @@ class StockHistoryError(RuntimeError):
 class StockHistoryClient:
     """Получение дневных исторических остатков WB через STOCK_HISTORY_DAILY_CSV."""
 
-    def __init__(self):
+    def __init__(self,guard=None,cabinet=None):
         self._cache = {}
         self._locks = {}
         self._last_create = {}
+        self.guard,self.cabinet=guard,cabinet
 
     async def get_stock_for_day(self, cabinet_code, day, nm_ids, stock_type):
         ids = tuple(sorted({n for value in nm_ids if (n := nm_id(value)) is not None}))
@@ -95,11 +96,14 @@ class StockHistoryClient:
 
     async def _request(self, session, method, path, **kwargs):
         for attempt in range(3):
+            if self.guard:await self.guard.before(self.cabinet,BASE_URL+path,21)
             try:
                 async with session.request(method, BASE_URL + path, **kwargs) as response:
                     body = await response.read()
                     if response.status in {200, 201, 202}:
                         return body
+                    if response.status == 429 and self.guard:
+                        raise self.guard.limited(self.cabinet,BASE_URL+path,response.headers)
                     if response.status == 429 and attempt < 2:
                         try:
                             delay = float(response.headers.get("Retry-After", "65"))

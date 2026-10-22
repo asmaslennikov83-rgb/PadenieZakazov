@@ -269,22 +269,8 @@ async def check_now(call: CallbackQuery, bot: Bot):
         return
 
     await call.answer("Запускаю анализ…")
-    await call.message.answer("⏳ Получаю заказы Wildberries и считаю падение…")
-
-    settings = await get_user_settings(call.from_user.id)
-    try:
-        await send_report(
-            bot=bot,
-            chat_id=call.message.chat.id,
-            settings=settings,
-            force_refresh=True,
-        )
-    except WBApiError as exc:
-        logger.exception("WB API error")
-        await call.message.answer(f"❌ Ошибка WB API:\n<code>{str(exc)}</code>")
-    except Exception as exc:
-        logger.exception("Unexpected report error")
-        await call.message.answer(f"❌ Не удалось сформировать отчёт: <code>{exc}</code>")
+    from modern_ui import quick_check
+    await quick_check(bot,call.message.chat.id,call.from_user.id)
 
 
 async def build_reports(
@@ -384,6 +370,8 @@ async def main() -> None:
     dp = Dispatcher()
     from modern_ui import router as modern_router, refresh_background, urgent_tick, correction_tick, store
     store.recover_interrupted_sources()
+    from runtime_diagnostics import stage
+    stage(DB_PATH,'startup','started',version='3.0.2')
     dp.include_router(modern_router)
     dp.include_router(router)
 

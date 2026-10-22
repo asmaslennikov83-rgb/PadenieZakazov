@@ -55,7 +55,8 @@ async def collect(store,cabinet,kind,run,end,meta):
     if state.get('job_day')!=str(end):
         state={'job_day':str(end),'id':str(uuid.uuid4()),'start':str(end-timedelta(days=6 if state.get('completed_day') else 89)),'created':False}
         store.sync_state(cabinet,source,state)
-    client=StockHistoryClient();cab=CABINETS[cabinet];token=cab.analytics_token or cab.token
+    from rate_guard import RateGuard
+    client=StockHistoryClient(RateGuard(store),cabinet);cab=CABINETS[cabinet];token=cab.analytics_token or cab.token
     if not token:raise StockHistoryError('Не задан токен Аналитики')
     ids=[int(r['nm_id']) for r in store.rows('SELECT nm_id FROM v3_products WHERE cabinet_id=?',(cabinet,))]
     if not ids:

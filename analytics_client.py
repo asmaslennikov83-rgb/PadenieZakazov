@@ -142,6 +142,8 @@ class AnalyticsClient:
         return {n: SearchMetrics(current.get(n), past.get(n)) for n in current.keys() | past.keys()}
 
     async def _post_json(self, cabinet_code: str, path: str, payload: dict[str, Any], optional_access: bool = False) -> Any:
+        if getattr(self,'transport',None):
+            return await self.transport.request(cabinet_code,'search','POST',BASE_URL+path,self._token(cabinet_code),interval=21,json=payload)
         await self._pace(cabinet_code, path)
         token = self._token(cabinet_code)
         timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)

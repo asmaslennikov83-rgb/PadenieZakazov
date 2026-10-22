@@ -17,6 +17,7 @@ from history_store import Store,key,now
 from collector import Collector
 from business_report import build,telegram
 from analytical_export import build_package
+from runtime_diagnostics import stage
 
 router=Router()
 store=Store(DB_PATH)
@@ -24,6 +25,9 @@ collector=Collector(store)
 TZ=ZoneInfo('Europe/Moscow')
 cache={}
 jobs=set()
+check_jobs={}
+build_task=None
+build_signature=None
 
 
 def selected(mode):return ['spb_tt','spb_tt_group'] if mode=='both' else [mode]
@@ -47,6 +51,7 @@ async def allowed(event):
 
 
 async def report_for(user_id,refresh=False):
+    global build_task,build_signature
     settings=await get_user_settings(user_id)
     day=datetime.now(TZ).date()-timedelta(days=1)
     codes=selected(settings.cabinet_mode)
@@ -57,7 +62,12 @@ async def report_for(user_id,refresh=False):
     signature=(user_id,str(day),settings.threshold,settings.cabinet_mode,json.dumps(store.preference(user_id),sort_keys=True),key(sorted(latest.items())))
     saved=cache.get(signature)
     if not refresh and saved and time.monotonic()-saved[0]<120:return saved[1]
-    report=await asyncio.to_thread(build,store,day,codes,settings.threshold,store.preference(user_id))
+    if build_task is not None and not build_task.done() and build_signature!=signature:
+        raise RuntimeError('REPORT_BUILD_BUSY')
+    if build_task is None or build_task.done():
+        build_signature=signature
+        build_task=asyncio.create_task(asyncio.to_thread(build,store,day,codes,settings.threshold,store.preference(user_id)))
+    report=await asyncio.shield(build_task)
     for old in list(cache):
         if old[0]==user_id or time.monotonic()-cache[old][0]>=120:cache.pop(old,None)
     cache[signature]=(time.monotonic(),report)
@@ -67,6 +77,49 @@ async def report_for(user_id,refresh=False):
 async def send_package(bot,chat_id,report):
     name,data=await asyncio.to_thread(build_package,report)
     await bot.send_document(chat_id,BufferedInputFile(data,filename=name),caption='Самостоятельный аналитический пакет: факты, история, словарь, ограничения и действия.')
+
+
+async def quick_check(bot,chat_id,user_id):
+    """Old check button now reads stored facts; network refresh has its own queue."""
+    if user_id in check_jobs and not check_jobs[user_id].done():
+        await bot.send_message(chat_id,'Предыдущий расчёт ещё выполняется. Повторный расчёт и новые запросы WB не запущены. /quality — загрузка.');return
+    async def run():
+        operation=key('check',user_id,time.monotonic());started=time.monotonic()
+        await bot.send_message(chat_id,'Формирую обзор из сохранённых данных. Загрузка WB идёт отдельно. Если данных ещё нет, это будет указано в обзоре. Версия 3.0.2.')
+        stage(store.path,operation,'report_start')
+        task=asyncio.create_task(quick_report_for(user_id))
+        try:
+            for attempt in range(3):
+                done,_=await asyncio.wait({task},timeout=30)
+                if done:break
+                stage(store.path,operation,'report_wait',elapsed_seconds=round(time.monotonic()-started))
+                await bot.send_message(chat_id,'Расчёт по локальной базе ещё выполняется. Ожидание на этом этапе не означает запрос или блокировку WB.')
+            if not task.done():
+                task.cancel()
+                stage(store.path,operation,'report_timeout',elapsed_seconds=round(time.monotonic()-started))
+                await bot.send_message(chat_id,'Расчёт локального отчёта превысил 90 секунд. Новые запросы WB этой кнопкой не запускались. Нужны логи Bothost и data/logs/runtime.log: возможны нехватка памяти, медленная база или остановка процесса. Не перезапускайте бота многократно.');return
+            text=task.result()
+            stage(store.path,operation,'report_ready',elapsed_seconds=round(time.monotonic()-started))
+            await bot.send_message(chat_id,text,reply_markup=menu())
+            await bot.send_message(chat_id,'Обзор готов. Полный пакет — кнопка Excel; обновление источников — «Обновить данные».')
+            stage(store.path,operation,'message_sent',elapsed_seconds=round(time.monotonic()-started))
+        except asyncio.CancelledError:
+            task.cancel();raise
+        except Exception as exc:
+            stage(store.path,operation,'failed',error_type=type(exc).__name__,elapsed_seconds=round(time.monotonic()-started))
+            await bot.send_message(chat_id,'Не удалось построить или отправить обзор. Код диагностики: '+operation+'. Проверьте журнал Bothost и data/logs/runtime.log. Токены и базу в чат присылать не нужно.')
+    check_jobs[user_id]=asyncio.create_task(run())
+    def finish(task):
+        if check_jobs.get(user_id) is task:check_jobs.pop(user_id,None)
+        if not task.cancelled():task.exception()
+    check_jobs[user_id].add_done_callback(finish)
+
+
+async def quick_report_for(user_id):
+    from brief_report import brief
+    settings=await get_user_settings(user_id)
+    day=datetime.now(TZ).date()-timedelta(days=1)
+    return await asyncio.to_thread(brief,store,day,selected(settings.cabinet_mode))
 
 
 async def send_report(bot,chat_id,settings,force_refresh=False,scheduled=False):
@@ -189,6 +242,20 @@ async def request_refresh(event,bot,user_id,chat_id):
     await event.answer('Запущено обновление заказов и дополнительных источников. Оно может занять несколько минут из-за ограничений WB. Если фоновая загрузка уже идёт, повторные запросы не запускаются. /quality — прогресс.')
 
 
+@router.message(Command('diagnostics'))
+async def diagnostics(message):
+    if not await allowed(message):return
+    import os
+    lines=['Версия 3.0.2; процесс '+str(os.getpid())+'. Эта команда не обращается к WB и не строит отчёт.']
+    memory=Path('/proc/self/status')
+    if memory.exists():
+        lines.extend(line for line in memory.read_text().splitlines() if line.startswith(('VmRSS:','VmHWM:')))
+    path=store.path.parent/'logs'/'runtime.log'
+    if path.is_file():lines.extend(path.read_text(encoding='utf-8',errors='replace').splitlines()[-12:])
+    else:lines.append('Журнал этапов пока не создан.')
+    await message.answer(escape('\n'.join(lines)[-3500:]))
+
+
 @router.callback_query(F.data.startswith('v3:'))
 async def view(call,bot):
     if not await allowed(call):return
@@ -198,9 +265,7 @@ async def view(call,bot):
     if kind=='settings':
         await call.message.answer('Существующие настройки сохранены. /menu — порог, сортировка, время, кабинет.\nДополнительные фильтры: /filters\nПроверить товар: /product nmID или артикул.\nИстория действий: /actions');return
     if kind=='legacy':
-        from bot import send_legacy_report
-        settings=await get_user_settings(call.from_user.id)
-        await send_legacy_report(bot,call.message.chat.id,settings,False);return
+        await quick_check(bot,call.message.chat.id,call.from_user.id);return
     if kind=='product':await call.message.answer('Введите /product и nmID или артикул продавца. При совпадениях будут предложены варианты.');return
     report=await report_for(call.from_user.id)
     if kind=='excel':await send_package(bot,call.message.chat.id,report)

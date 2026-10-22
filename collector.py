@@ -13,6 +13,7 @@ from data_quality import nm_id, number, count
 from history_store import Store, now, key, dumps
 from stock_history_client import StockHistoryError
 from analytics_client import AnalyticsError
+from rate_guard import RateGuard,Deferred
 
 MSK=ZoneInfo('Europe/Moscow')
 
@@ -46,9 +47,10 @@ class ReadOnlyHTTP:
       ('GET','https://advert-api.wildberries.ru/adv/v1/promotion/count'),
       ('GET','https://advert-api.wildberries.ru/adv/v3/fullstats'),
     }
-    def __init__(self):
+    def __init__(self,store=None):
         self.last={}
         self.locks={}
+        self.guard=RateGuard(store) if store is not None else None
 
     async def request(self,cabinet,source,method,url,token,interval=21,**kwargs):
         if (method,url) not in self.ALLOWED: raise ValueError('Не разрешён метод read-only адаптера')
@@ -56,6 +58,7 @@ class ReadOnlyHTTP:
         lock=self.locks.setdefault((cabinet,source),asyncio.Lock())
         async with lock:
             for attempt in range(3):
+                if self.guard:await self.guard.before(cabinet,url,interval)
                 wait=max(0,interval-(time.monotonic()-self.last.get((cabinet,source),0)))
                 await asyncio.sleep(wait)
                 self.last[cabinet,source]=time.monotonic()
@@ -69,6 +72,8 @@ class ReadOnlyHTTP:
                                 except (ValueError,UnicodeDecodeError): raise SourceError('ERROR','Ответ не является JSON')
                             if response.status in {401,403}: raise SourceError('NO_ACCESS',f'HTTP {response.status}: проверьте категорию токена и кабинет')
                             if response.status==402: raise SourceError('NO_ACCESS','HTTP 402: проверьте условия доступа/подписку; автоматически не подключается')
+                            if response.status==429 and self.guard:
+                                raise self.guard.limited(cabinet,url,response.headers)
                             if response.status==429 and attempt<2:
                                 try: delay=float(response.headers.get('Retry-After','65'))
                                 except ValueError: delay=65
@@ -87,7 +92,7 @@ class ReadOnlyHTTP:
 class Collector:
     def __init__(self,store:Store,http=None):
         self.store=store
-        self.http=http or ReadOnlyHTTP()
+        self.http=http or ReadOnlyHTTP(store)
 
     def token(self,cabinet,category):
         suffix={'spb_tt':'SPB_TT','spb_tt_group':'SPB_TT_GROUP'}[cabinet]
@@ -104,6 +109,8 @@ class Collector:
             async with asyncio.timeout(budget):
                 await operation(meta)
             meta.update(status='OK',reason='Получено по контракту источника')
+        except Deferred as exc:
+            meta.update(status='PARTIAL',phase='WAITING_RETRY',reason=str(exc),retry_at=exc.retry_at)
         except SourceError as exc:
             meta.update(status='PARTIAL' if meta['records'] else exc.status,reason=str(exc))
         except (StockHistoryError,AnalyticsError) as exc:
@@ -119,7 +126,7 @@ class Collector:
             meta.update(status='PARTIAL' if meta['records'] else 'ERROR',reason=f'Ошибка адаптера {type(exc).__name__}; ответ не экспортируется')
         meta['last_success_at']=meta.get('last_success_at') if meta.get('cache_hit') or meta['status']!='OK' else now()
         meta['completed_at']=now()
-        meta.update(phase='FINISHED' if meta['status']=='OK' else 'FAILED',updated_at=meta['completed_at'])
+        meta.update(phase='WAITING_RETRY' if meta.get('retry_at') else 'FINISHED' if meta['status']=='OK' else 'FAILED',updated_at=meta['completed_at'])
         self.store.source(run,cabinet,source,**meta)
         return meta
 
@@ -169,12 +176,17 @@ class Collector:
     async def ledger(self,run,cabinet,source,meta):
         today=datetime.now(MSK).date()
         state=self.store.sync_state(cabinet,source)
-        start=date.fromisoformat(state['history_start']) if state.get('history_start') else today-timedelta(days=int(os.getenv('WB_HISTORY_DAYS','90')))
+        history_days=max(15,int(os.getenv('WB_HISTORY_DAYS','90')))
+        initial_days=max(15,min(history_days,int(os.getenv('WB_INITIAL_DAYS','15'))))
+        target=today-timedelta(days=history_days)
+        start=date.fromisoformat(state['history_start']) if state.get('history_start') else today-timedelta(days=initial_days)
         pending=state.get('pending_cursor')
+        backfill=bool(state.get('completed_at') and not pending and start>target)
+        if backfill:start=max(target,start-timedelta(days=initial_days))
         # After downtime, cover the missed interval too; never jump straight to 7 days ago.
         recent=(today-timedelta(days=7)).isoformat()
         previous=(date.fromisoformat(state['completed_at'][:10])-timedelta(days=2)).isoformat() if state.get('completed_at') else start.isoformat()
-        cursor=pending or min(recent,previous)
+        cursor=pending or (str(start) if backfill else min(recent,previous))
         meta.update(period_start=str(start),period_end=str(today-timedelta(days=1)),cursor=cursor)
         self.store.source(run,cabinet,source,**meta)
         seen=set()
@@ -184,7 +196,7 @@ class Collector:
             if not isinstance(page,list): raise SourceError('ERROR','Ожидался массив событий Statistics')
             if not page:
                 self.store.cover(run,cabinet,source,max(start,today-timedelta(days=90)),today-timedelta(days=1))
-                self.store.sync_state(cabinet,source,{'history_start':str(start),'completed_at':now(),'pending_cursor':None})
+                self.store.sync_state(cabinet,source,{'history_start':str(start),'target_history_start':str(target),'backfill_complete':start<=target,'completed_at':now(),'pending_cursor':None})
                 self.progress(run,cabinet,source,meta)
                 return
             signature=key(page)
@@ -375,7 +387,9 @@ class Collector:
         meta.update(period_start=str(first_start),period_end=str(last_end))
 
     async def search(self,run,cabinet,meta):
-        from analytics_client import analytics_client
+        from analytics_client import AnalyticsClient
+        analytics_client=AnalyticsClient()
+        analytics_client.transport=self.http
         today=datetime.now(MSK).date();end=today-timedelta(days=2);start=end-timedelta(days=6)
         ids=[int(x['nm_id']) for x in self.store.rows('SELECT nm_id FROM v3_products WHERE cabinet_id=?',(cabinet,))]
         if not ids:raise SourceError('MISSING','Нет известных nmId; права поиска пока не проверены')
